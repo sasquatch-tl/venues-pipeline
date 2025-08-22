@@ -1,4 +1,4 @@
-name: Build WA Venues CSV
+name: Build WA Venues CSV (Setlist.fm + MusicBrainz)
 
 on:
   schedule:
@@ -11,10 +11,7 @@ jobs:
     permissions:
       contents: write
     env:
-      TM_API_KEY: ${{ secrets.TICKETMASTER_API_KEY }}
-      ENABLE_WEB_SEARCH: "0"        # set "1" to attempt site discovery for missing websites (DuckDuckGo HTML)
-      ENABLE_EVENT_PROOF: "1"       # require upcoming shows as part of scoring
-      SONGKICK_API_KEY: ${{ secrets.SONGKICK_API_KEY }} # optional but recommended
+      SETLISTFM_API_KEY: ${{ secrets.SETLISTFM_API_KEY }}   # required
     steps:
       - uses: actions/checkout@v4
 
@@ -23,581 +20,227 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Build CSVs
+      - name: Build CSV
         run: |
           node -v
           mkdir -p scripts data
           cat > scripts/build_wa_csvs.js <<'EOF'
           const fs = require('fs').promises;
-          const { URL } = require('url');
 
-          // -------------------------------
-          // Filters & heuristics
-          // -------------------------------
-          const EXCLUDE_CATEGORIES_RE = new RegExp(
-            [
-              'casino',
-              'perform(ing)?\\s*arts?\\s*center',
-              '\\bPAC\\b',
-              'museum',
-              'movie\\s*(theatre|theater)|cinema|cineplex|imax|regal|amc',
-              'event\\s*center|convention\\s*center|expo\\s*center|civic\\s*center',
-              'fairgrounds?|fields?|stadium|ballpark|speedway|raceway|drive-?in',
-              'roadhouse',
-              'elk\\w*\\s*lodge|moose\\s*lodge|masonic\\s*lodge|vfw|american\\s*legion',
-              'bowling|skating\\s*rink',
-              'waterpark|theme\\s*park|amusement\\s*park',
-              'community\\s*center|senior\\s*center|rec(reation)?\\s*center',
-              'library|church|chapel|synagogue|temple'
-            ].join('|'),
-            'i'
-          );
-          const EXCLUDE_VENUE_NAME_RE = /\b(bar|pub|tavern|grill|saloon|taproom|brewery|cafe|coffee)\b/i;
-          const EXCLUDE_DEFUNCT_RE = /\b(former|defunct|closed|permanently\s*closed|relocated)\b/i;
-          const CLOSED_RE = /\b(permanently\s*closed|we('?ve)?\s*closed|closed\s*for\s*good|defunct|ceased\s*operations)\b/i;
-
-          const REGION = 'West';
-          const STATE = 'WA';
+          const UA = 'wa-venues-pipeline/4.0 (contact: you@example.com)';
           const DAY_MS = 86400000;
+          const LOOKBACK_DAYS = 365;     // past 12 months
+          const LOOKAHEAD_DAYS = 180;    // next 6 months
+          const MIN_EVENTS = 2;          // must have >=2 events in window
 
-          function escapeCSV(s='') {
-            const v = String(s ?? '');
-            return /[",\n]/.test(v) ? `"${v.replace(/"/g,'""')}"` : v;
-          }
-          function unique(arr) { return Array.from(new Set(arr.filter(Boolean))); }
-          function key(name, city) { return (name||'').trim().toLowerCase()+'||'+(city||'').trim().toLowerCase(); }
-
-          function guessVenueType(name='') {
-            const s = name.toLowerCase();
-            if (s.includes('amphitheat')) return 'Amphitheatre';
-            if (s.includes('arena')) return 'Arena';
-            if (s.includes('theatre') || s.includes('theater')) return 'Theatre';
-            if (s.includes('hall')) return 'Hall';
-            if (s.includes('auditorium')) return 'Auditorium';
-            if (s.includes('pavilion')) return 'Pavilion';
-            if (s.includes('ballroom')) return 'Ballroom';
-            if (s.includes('club')) return 'Club';
-            return 'Venue';
-          }
+          const WA_CITIES = [
+            'Seattle','Tacoma','Bellevue','Redmond','Kirkland','Everett','Bellingham',
+            'Spokane','Olympia','Vancouver','Kennewick','Richland','Pasco',
+            'Yakima','Wenatchee','Pullman','Ellensburg','Bremerton','Port Angeles'
+          ];
 
           async function fetchJSON(url, headers={}) {
-            const r = await fetch(url, { headers });
+            const r = await fetch(url, { headers: { 'User-Agent': UA, ...headers }});
             if (!r.ok) throw new Error(\`HTTP \${r.status} for \${url}\`);
             return r.json();
           }
           async function fetchText(url, headers={}) {
-            const r = await fetch(url, { headers });
+            const r = await fetch(url, { headers: { 'User-Agent': UA, ...headers }});
             if (!r.ok) throw new Error(\`HTTP \${r.status} for \${url}\`);
             return r.text();
           }
+          function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
 
-          // -------- Age extraction (TM rules & Wikidata min age) --------
-          function extractAge(text='') {
-            const t = String(text || '').toLowerCase();
-            if (!t) return '';
-            if (/\ball[-\s]*ages\b/.test(t)) return 'All Ages';
-            const m = t.match(/\b(21|20|19|18)\s*\+\b/);
-            if (m) return \`\${m[1]}+\`;
-            if (/\bunder\s*18\s*not\s*admitted\b/.test(t)) return '18+';
-            return '';
+          function escapeCSV(s='') {
+            const v = String(s ?? '');
+            return /[",\n]/.test(v) ? \`"\${v.replace(/"/g,'""')}"\` : v;
           }
 
-          function shouldKeepByName(name='') {
-            const n = name || '';
-            if (!n.trim()) return false;
-            if (EXCLUDE_DEFUNCT_RE.test(n)) return false;
-            if (EXCLUDE_VENUE_NAME_RE.test(n)) return false;
-            if (EXCLUDE_CATEGORIES_RE.test(n)) return false;
-            return true;
+          // ---------- Setlist.fm ----------
+          async function setlistfmGET(path, params={}) {
+            const qs = new URLSearchParams(params).toString();
+            const url = \`https://api.setlist.fm/rest/1.0\${path}\${qs ? '?' + qs : ''}\`;
+            return fetchJSON(url, {
+              'Accept': 'application/json',
+              'x-api-key': process.env.SETLISTFM_API_KEY
+            });
           }
 
-          // ------------- Ticketmaster (seed list only, no TM links) -------------
-          async function fetchTicketmasterVenuesWA(apiKey, maxPages=5) {
-            const out = [];
-            const size = 200;
-            for (let page=0; page<maxPages; page++) {
-              const url = \`https://app.ticketmaster.com/discovery/v2/venues.json?countryCode=US&stateCode=\${STATE}&size=\${size}&page=\${page}&apikey=\${encodeURIComponent(apiKey)}\`;
-              const data = await fetchJSON(url, { 'User-Agent':'wa-venues-pipeline/1.4' });
-              const venues = data?._embedded?.venues || [];
-              if (!venues.length) break;
-
-              for (const v of venues) {
-                const name = (v.name||'').trim();
-                const city = v.city?.name || '(Unknown City)';
-                if (!shouldKeepByName(name)) continue;
-
-                const childRule = v.generalInfo?.childRule || '';
-                const generalRule = v.generalInfo?.generalRule || '';
-                const age = extractAge(\`\${childRule}\n\${generalRule}\`);
-
-                out.push({
-                  name, city, state: STATE,
-                  capacity: '', age,
-                  region: REGION,
-                  venueType: guessVenueType(name),
-                  genres: '',
-                  image: '', website: '',
-                  social: [],
-                  sources: ['Ticketmaster'],
-                  id: v.id ? \`tmv-\${v.id}\` : '',
-                  confidence: 75 + (age ? 3 : 0)
-                });
-              }
-              if (venues.length < size) break;
-              await new Promise(r=>setTimeout(r, 120));
+          async function getVenuesForCity(city){
+            let venues = [];
+            let page = 1;
+            while (page <= 3) {
+              const data = await setlistfmGET('/search/venues', { cityName: city, stateCode: 'WA', p: page });
+              const vs = data?.venues || [];
+              venues.push(...vs);
+              const total = Number(data?.total) || vs.length;
+              if (page >= Math.ceil(total/20)) break;
+              page++;
+              await sleep(150);
             }
-            return out;
+            return venues;
           }
 
-          // ------------- Wikidata (music-venue classes; adds P576 dissolved) -------------
-          async function fetchWikidataWA() {
-            const qidWA = 'Q1223';
-            const classes = ['Q17350442','Q13219666','Q164432','Q15961988','Q15938568','Q171730']; // concert hall, music venue, etc.
-            const sparql = `
-            SELECT ?item ?itemLabel ?cityLabel ?website ?capacity ?image ?minage ?endtime ?facebook ?instagram ?twitter WHERE {
-              VALUES ?class { ${classes.map(q=>`wd:${q}`).join(' ')} }
-              ?item wdt:P31/wdt:P279* ?class .
-              ?item wdt:P131* wd:${qidWA} .
-              OPTIONAL { ?item wdt:P856 ?website. }
-              OPTIONAL { ?item wdt:P1083 ?capacity. }
-              OPTIONAL { ?item wdt:P18 ?image. }
-              OPTIONAL { ?item wdt:P131 ?city. }
-              OPTIONAL { ?item wdt:P2899 ?minage. }
-              OPTIONAL { ?item wdt:P576 ?endtime. }          # dissolved/abolished
-              OPTIONAL { ?item wdt:P2013 ?facebook. }
-              OPTIONAL { ?item wdt:P2003 ?instagram. }
-              OPTIONAL { ?item wdt:P2002 ?twitter. }
-              SERVICE wikibase:label { bd:serviceParam wikibase:language "en". }
-            }`;
-            const url = 'https://query.wikidata.org/sparql?format=json&query=' + encodeURIComponent(sparql);
-            const data = await fetchJSON(url, { 'User-Agent':'wa-venues-pipeline/1.4' });
-            const rows = data?.results?.bindings || [];
-            const out = [];
-            for (const b of rows) {
-              const name = (b.itemLabel?.value || '').trim();
-              if (!name || !shouldKeepByName(name)) continue;
-              const city = (b.cityLabel?.value || '(Unknown City)').trim();
-              const website = (b.website?.value || '').trim();
-              const capacity = b.capacity?.value ? Number(b.capacity.value) : '';
-              const image = (b.image?.value || '').trim();
-              const minage = b.minage?.value ? String(b.minage.value) : '';
-              const age = minage ? \`\${minage}+\` : '';
-              const endtime = b.endtime?.value || '';
-              const social = [];
-              if (b.facebook?.value) social.push(\`https://facebook.com/\${b.facebook.value}\`);
-              if (b.instagram?.value) social.push(\`https://instagram.com/\${b.instagram.value}\`);
-              if (b.twitter?.value) social.push(\`https://x.com/\${b.twitter.value}\`);
-
-              const row = {
-                name, city, state: STATE,
-                capacity, age,
-                region: REGION,
-                venueType: guessVenueType(name),
-                genres: '',
-                image, website,
-                social,
-                sources: ['WikidataSPARQL'],
-                id: 'wd-' + (b.item?.value?.split('/').pop() || ''),
-                confidence: 92 + (website ? 3 : 0)
-              };
-              if (endtime) row._wdDefunct = true;
-              out.push(row);
-            }
-            return out;
-          }
-
-          // ------------- Optional: discover official site if missing -------------
-          async function discoverWebsiteBySearch(name, city, limit=1) {
-            if (process.env.ENABLE_WEB_SEARCH !== '1') return '';
-            const q = encodeURIComponent(\`\${name} \${city} official site\`);
-            const url = \`https://html.duckduckgo.com/html/?q=\${q}\`;
-            try {
-              const html = await fetchText(url, { 'User-Agent':'wa-venues-pipeline/1.4' });
-              const links = Array.from(html.matchAll(/<a[^>]+class="result__a"[^>]+href="([^"]+)"/g)).map(m=>m[1]);
-              const blacklist = ['ticketmaster','facebook','instagram','x.com','twitter','bandsintown','songkick',
-                                 'yelp','tripadvisor','google','wikipedia','wikidata','eventbrite','stubhub','map'];
-              for (const href of links) {
-                try {
-                  const u = new URL(href);
-                  const host = u.hostname.toLowerCase();
-                  if (blacklist.some(b=>host.includes(b))) continue;
-                  return u.origin;
-                } catch {}
+          async function countEvents(venueId, fromISO, toISO){
+            let count = 0, latest = null, page = 1;
+            while (page <= 3) {
+              const data = await setlistfmGET(\`/venue/\${venueId}/setlists\`, { p: page });
+              const sets = data?.setlist || [];
+              for (const s of sets) {
+                const d = s?.eventDate; // "DD-MM-YYYY"
+                if (!d) continue;
+                const [dd, mm, yyyy] = d.split('-').map(x=>parseInt(x,10));
+                const iso = \`\${yyyy}-\${String(mm).padStart(2,'0')}-\${String(dd).padStart(2,'0')}\`;
+                const dt = new Date(iso);
+                const from = new Date(fromISO), to = new Date(toISO);
+                if (!isNaN(dt) && dt >= from && dt <= to) {
+                  count++;
+                  if (!latest || dt > latest) latest = dt;
+                }
               }
-            } catch {}
-            return '';
+              const total = Number(data?.total) || sets.length;
+              if (page >= Math.ceil(total/20)) break;
+              page++;
+              await sleep(150);
+            }
+            return { count, latest: latest ? latest.toISOString().slice(0,10) : '' };
           }
 
-          // ------------- Logo & social extraction -------------
-          function absolutize(base, href) { try { return new URL(href, base).toString(); } catch { return ''; } }
-          function pickLogoFromHTML(baseUrl, html) {
+          // ---------- MusicBrainz ----------
+          async function mbSearchVenue(name, city){
+            const q = encodeURIComponent(\`"\${name}" AND address:\${city} AND country:US\`);
+            const url = \`https://musicbrainz.org/ws/2/place?query=\${q}&fmt=json\`;
+            const data = await fetchJSON(url, { 'Accept': 'application/json' });
+            return data?.places?.[0] || null;
+          }
+          async function mbPlaceUrls(mbid){
+            const url = \`https://musicbrainz.org/ws/2/place/\${mbid}?inc=url-rels&fmt=json\`;
+            const data = await fetchJSON(url, { 'Accept': 'application/json' });
+            const rels = data?.relations || [];
+            const urls = rels.map(r => r.url?.resource).filter(Boolean);
+            const homepage = urls.find(u => /https?:\/\/(www\.)?[^\/]+\/?$/.test(u)) || '';
+            return { homepage, urls };
+          }
+
+          // ---------- Image / social scrape ----------
+          function absolutize(base, href){ try { return new URL(href, base).toString(); } catch { return ''; } }
+          function pickBestImage(base, html){
             const candidates = [];
-            for (const rel of ['icon','shortcut icon','apple-touch-icon','apple-touch-icon-precomposed','mask-icon']) {
-              const re = new RegExp(\`<link[^>]+rel=["']?\${rel}["']?[^>]*href=["']([^"']+)["']\`, 'ig');
-              let m; while ((m = re.exec(html))) candidates.push({src: absolutize(baseUrl, m[1]), score: 60});
+            // hero/logo <img>
+            const imgRe = /<img[^>]+src=["']([^"']+)["'][^>]*>/ig;
+            let m;
+            while ((m = imgRe.exec(html))) {
+              const tag = m[0], src = absolutize(base, m[1]);
+              let score = 50;
+              if (/logo/i.test(src)) score += 25;
+              if (/hero|banner/i.test(src)) score += 20;
+              const wh = tag.match(/\b(width|height)=["']?(\d{2,4})/ig);
+              if (wh) score += wh.length*10;
+              candidates.push({src,score});
             }
-            { // og:image
-              const re = /<meta[^>]+property=["']og:image["'][^>]*content=["']([^"']+)["']/ig;
-              let m; while ((m = re.exec(html))) candidates.push({src: absolutize(baseUrl, m[1]), score: 55});
+            // og:image
+            const og = Array.from(html.matchAll(/<meta[^>]+property=["']og:image["'][^>]*content=["']([^"']+)["']/ig)).map(x=>absolutize(base,x[1]));
+            og.forEach(u=>candidates.push({src:u,score:70}));
+            // background-image
+            const bg = Array.from(html.matchAll(/background-image:\s*url\(["']?([^"')]+)["']?\)/ig)).map(x=>absolutize(base,x[1]));
+            bg.forEach(u=>candidates.push({src:u,score:65}));
+            // icons
+            const icons = Array.from(html.matchAll(/<link[^>]+rel=["'](?:icon|apple-touch-icon)["'][^>]*href=["']([^"']+)["']/ig)).map(x=>absolutize(base,x[1]));
+            icons.forEach(u=>candidates.push({src:u,score:40}));
+
+            const seen = new Set(), ranked=[];
+            for (const c of candidates){
+              const key=c.src.replace(/\?.*$/,'');
+              if (!key || seen.has(key)) continue;
+              seen.add(key); ranked.push(c);
             }
-            { // <img src *= logo
-              const re = /<img[^>]+src=["']([^"']+)["'][^>]*>/ig;
-              let m; while ((m = re.exec(html))) {
-                const src = absolutize(baseUrl, m[1]);
-                if (/logo/i.test(src)) candidates.push({src, score: 80});
-              }
-            }
-            const ranked = [];
-            const seen = new Set();
-            for (const c of candidates) {
-              const key = c.src.replace(/\?.*$/, '');
-              if (seen.has(key)) continue;
-              seen.add(key);
-              ranked.push(c);
-            }
-            ranked.sort((a,b)=>b.score - a.score);
+            ranked.sort((a,b)=>b.score-a.score);
             return ranked[0]?.src || '';
           }
 
-          async function enrichFromSite(rows, maxFetch=70) {
-            let count = 0;
-            for (const r of rows) {
-              if (!r.website) continue;
-              if (count >= maxFetch) break;
-              try {
-                const html = await fetchText(r.website, { 'User-Agent':'wa-venues-pipeline/1.4' });
-                if (!r.image) {
-                  const logo = pickLogoFromHTML(r.website, html);
-                  if (logo) r.image = logo;
-                }
-                const social = r.social || [];
-                const reLink = /<a[^>]+href=["']([^"']+)["'][^>]*>/ig;
-                let m;
-                while ((m = reLink.exec(html))) {
-                  const href = m[1];
-                  if (/instagram\.com\//i.test(href)) social.push(href);
-                  else if (/facebook\.com\//i.test(href)) social.push(href);
-                  else if (/(twitter\.com|x\.com)\//i.test(href)) social.push(href);
-                }
-                r.social = unique(social);
-                // keep a hint of recent copyright year
-                const years = Array.from(String(html).matchAll(/\b(20\d{2})\b/g)).map(m=>parseInt(m[1],10));
-                if (years.length) r._copyright_year = Math.max(...years);
-              } catch {}
-              count++;
-              await new Promise(res=>setTimeout(res, 200));
-            }
-            return rows;
-          }
-
-          // ------------- Event proof: detect upcoming shows -------------
-          function parseDatesFromHTML(html) {
-            const dates = new Set();
-
-            // JSON-LD Event blocks
-            const jsonld = Array.from(html.matchAll(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/ig))
-              .map(m=>m[1]);
-            for (const block of jsonld) {
-              try {
-                const data = JSON.parse(block);
-                const items = Array.isArray(data) ? data : [data];
-                for (const it of items) {
-                  const arr = Array.isArray(it) ? it : [it];
-                  for (const x of arr) {
-                    const types = Array.isArray(x['@type']) ? x['@type'] : [x['@type']];
-                    if (types && types.includes('Event') && x.startDate) {
-                      dates.add(String(x.startDate));
-                    }
-                    if (x.event && Array.isArray(x.event)) {
-                      for (const e of x.event) if (e.startDate) dates.add(String(e.startDate));
-                    }
-                  }
-                }
-              } catch {}
-            }
-
-            // iCal links (.ics)
-            const ical = Array.from(html.matchAll(/href=["']([^"']+\.ics(\?[^"']*)?)["']/ig)).map(m=>m[1]);
-            ical.forEach(d=>dates.add(d));
-
-            // Human-readable months
-            const human = Array.from(html.matchAll(/\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\s+\d{1,2}(?:,\s*\d{4})?/ig)).map(m=>m[0]);
-            human.forEach(d=>dates.add(d));
-
-            return Array.from(dates);
-          }
-
-          function hasUpcomingDate(dates, lookaheadDays=180, now=new Date()) {
-            const cutoff = new Date(now.getTime() + lookaheadDays*DAY_MS);
-            for (const d of dates) {
-              let dt = new Date(d);
-              if (isNaN(dt)) {
-                const tryD = Date.parse(d);
-                if (!isNaN(tryD)) dt = new Date(tryD);
-                else continue;
-              }
-              if (dt >= now && dt <= cutoff) return true;
-            }
-            return false;
-          }
-
-          async function siteHasUpcomingEvents(baseUrl, lookaheadDays=180) {
-            const paths = ['', '/events', '/calendar', '/shows', '/concerts', '/schedule'];
-            for (const p of paths) {
-              try {
-                const url = new URL(p || '/', baseUrl).toString();
-                const html = await fetchText(url, { 'User-Agent':'wa-venues-pipeline/1.4' });
-                const dates = parseDatesFromHTML(html);
-                if (hasUpcomingDate(dates, lookaheadDays)) return { ok: true, html };
-                if (dates.some(x => typeof x === 'string' && x.includes('.ics'))) return { ok: true, html };
-                if (CLOSED_RE.test(html)) return { ok: false, html, closed: true };
-              } catch {}
-              await new Promise(r=>setTimeout(r, 150));
-            }
-            return { ok: false };
-          }
-
-          async function songkickHasUpcoming(name, city) {
-            const key = process.env.SONGKICK_API_KEY;
-            if (!key) return false;
+          async function enrichFromWebsite(row){
+            if (!row.website) return row;
             try {
-              const q = encodeURIComponent(\`\${name} \${city}\`);
-              const sUrl = \`https://api.songkick.com/api/3.0/search/venues.json?query=\${q}&apikey=\${key}\`;
-              const s = await fetchJSON(sUrl);
-              const venue = s?.resultsPage?.results?.venue?.[0];
-              if (!venue?.id) return false;
-              const calUrl = \`https://api.songkick.com/api/3.0/venues/\${venue.id}/calendar.json?apikey=\${key}\`;
-              const cal = await fetchJSON(calUrl);
-              const evts = cal?.resultsPage?.results?.event || [];
-              const now = new Date();
-              for (const e of evts) {
-                const dt = new Date(e.start?.date || '');
-                if (!isNaN(dt) && dt >= now) return true;
+              const html = await fetchText(row.website);
+              if (!row.image) row.image = pickBestImage(row.website, html);
+              const social = row.social||[];
+              const reLink=/<a[^>]+href=["']([^"']+)["']/ig; let m;
+              while ((m=reLink.exec(html))){
+                const href=m[1];
+                if (/instagram\.com\//i.test(href)) social.push(href);
+                if (/facebook\.com\//i.test(href)) social.push(href);
+                if (/(twitter\.com|x\.com)\//i.test(href)) social.push(href);
               }
+              row.social=[...new Set(social)];
             } catch {}
-            return false;
+            return row;
           }
 
-          // Evidence scoring & gating
-          async function detectSiteEvidence(website, lookaheadDays=120) {
-            let looksDefunct = false;
-            let activeNow = false;
-            let lastEventDate = null;
-            const sources = new Set();
-
-            const paths = ['', '/events', '/calendar', '/shows', '/concerts', '/schedule'];
-            for (const p of paths) {
-              let html = '';
-              try {
-                const url = new URL(p || '/', website).toString();
-                html = await fetchText(url, { 'User-Agent':'wa-venues-pipeline/1.4' });
-              } catch { continue; }
-
-              if (CLOSED_RE.test(html)) looksDefunct = true;
-
-              const dates = parseDatesFromHTML(html);
-              if (dates.length) {
-                const now = new Date();
-                const futureDates = dates
-                  .map(d => new Date(d))
-                  .filter(d => !isNaN(d) && d >= now)
-                  .sort((a,b)=>a-b);
-                if (futureDates[0]) {
-                  lastEventDate = futureDates[futureDates.length-1].toISOString().slice(0,10);
-                  sources.add('site-dates');
-                }
-                if (html.includes('application/ld+json')) sources.add('site-jsonld');
-                if (dates.some(x => typeof x === 'string' && x.includes('.ics'))) sources.add('site-ics');
-              }
-
-              const years = Array.from(String(html).matchAll(/\b(20\d{2})\b/g)).map(m=>parseInt(m[1],10));
-              if (years.length) {
-                const cy = Math.max(...years);
-                const thisYear = new Date().getFullYear();
-                if (cy >= thisYear - 1) activeNow = true;
-              }
-            }
-
-            return { looksDefunct, activeNow, lastEventDate, siteSources: Array.from(sources) };
-          }
-
-          async function scoreAndFilter(rows, {requireThreshold=3, lookaheadDays=120, maxChecks=160} = {}) {
-            const out = [];
-            let checked = 0;
-
-            for (const r of rows) {
-              let score = 0;
-              const evidence = new Set();
-
-              // Wikidata class bias
-              if (r.sources?.includes('WikidataSPARQL')) { score += 1; evidence.add('wikidata'); }
-              if (r._wdDefunct) { score -= 2; evidence.add('wd-defunct'); }
-
-              // Official site evidence
-              if (r.website && checked < maxChecks) {
-                try {
-                  const { looksDefunct, activeNow, lastEventDate, siteSources } = await detectSiteEvidence(r.website, lookaheadDays);
-                  if (looksDefunct) { score -= 2; evidence.add('site-closed'); }
-                  if (activeNow) { score += 1; evidence.add('site-active'); }
-                  if (siteSources.length && lastEventDate) {
-                    const dt = new Date(lastEventDate);
-                    const now = new Date();
-                    const cutoff = new Date(now.getTime() + lookaheadDays*DAY_MS);
-                    if (!isNaN(dt) && dt >= now && dt <= cutoff) {
-                      score += 2; evidence.add('site-upcoming');
-                    }
-                  }
-                  if (lastEventDate) r.last_event_date = lastEventDate;
-                } catch {}
-                checked++;
-              }
-
-              // Songkick confirmation
-              if (await songkickHasUpcoming(r.name, r.city)) {
-                score += 1; evidence.add('songkick');
-              }
-
-              r.evidence_score = score;
-              r.evidence_sources = Array.from(evidence).sort().join('|');
-
-              if (score >= requireThreshold) out.push(r);
-            }
-            return out;
-          }
-
-          function mergeAndDedupe(a, b) {
-            const m = new Map();
-            const put = (v) => {
-              const k = key(v.name, v.city);
-              if (!m.has(k)) { m.set(k, v); return; }
-              const t = m.get(k);
-              if (!t.website && v.website) t.website = v.website;
-              if (!t.image && v.image) t.image = v.image;
-              if (!t.capacity && v.capacity) t.capacity = v.capacity;
-              if (!t.venueType && v.venueType) t.venueType = v.venueType;
-              if (!t.age && v.age) t.age = v.age;
-              t.social = Array.from(new Set([...(t.social||[]), ...(v.social||[])]));
-              t.sources = Array.from(new Set([...(t.sources||[]), ...(v.sources||[])]));
-              t.confidence = Math.max(t.confidence||0, v.confidence||0);
-            };
-            [...a, ...b].forEach(put);
-            return [...m.values()].filter(v =>
-              shouldKeepByName(v.name || '') &&
-              !/\b(former|defunct|closed)\b/i.test(v.name || '')
-            ).sort((x,y)=>
-              x.state.localeCompare(y.state) ||
-              x.city.localeCompare(y.city) ||
-              x.name.localeCompare(y.name)
-            );
-          }
-
-          function dedupeByDomain(rows) {
-            const map = new Map();
-            for (const r of rows) {
-              const host = (() => {
-                try { return r.website ? new URL(r.website).hostname.replace(/^www\./,'') : ''; } catch { return ''; }
-              })();
-              const key = \`\${r.name.toLowerCase()}||\${r.city.toLowerCase()}||\${host}\`;
-              if (!map.has(key)) { map.set(key, r); continue; }
-              const prev = map.get(key);
-              const a = r.evidence_score ?? 0, b = prev.evidence_score ?? 0;
-              if (a > b) map.set(key, r);
-            }
-            return Array.from(map.values());
-          }
-
-          function toCSV(rows) {
-            const headers = [
-              'Venue Name','City','State','Capacity','Age Restrictions','Region','Venue Type','Genres (top 3)',
-              'Image','Website','Social Links','Source(s)','Venue ID','Confidence',
-              'Evidence Score','Evidence Sources','Last Event Date'
-            ];
-            const lines = [headers.map(escapeCSV).join(',')];
-            for (const r of rows) {
-              lines.push([
-                r.name, r.city, r.state, r.capacity, r.age, r.region, r.venueType, r.genres, r.image, r.website,
-                (r.social||[]).join('|'), (r.sources||[]).join(';'), r.id, r.confidence,
-                r.evidence_score ?? '', r.evidence_sources ?? '', r.last_event_date || ''
-              ].map(escapeCSV).join(','));
-            }
-            return lines.join('\n')+'\n';
-          }
-
-          // Manual overrides
-          async function applyOverrides(rows) {
-            let block = [], allow = [];
+          // ---------- Main ----------
+          (async ()=>{
             try {
-              const raw = await fs.readFile('data/overrides.json','utf8');
-              const json = JSON.parse(raw || '{}');
-              block = json.blocklist || [];
-              allow = json.allowlist || [];
-            } catch {}
-            // blocklist by "Name||City" OR domain
-            const blocked = new Set(block.map(x=>String(x).toLowerCase()));
-            const isBlocked = (r) => {
-              const byPair = blocked.has(\`\${r.name.toLowerCase()}||\${r.city.toLowerCase()}\`);
-              const byDomain = (() => {
-                try {
-                  const d = r.website ? new URL(r.website).hostname.replace(/^www\./,'').toLowerCase() : '';
-                  return blocked.has(d);
-                } catch { return false; }
-              })();
-              return byPair || byDomain;
-            };
-            // allowlist by "Name||City"
-            const allowed = new Set(allow.map(x=>String(x).toLowerCase()));
-            const isAllowed = (r) => allowed.has(\`\${r.name.toLowerCase()}||\${r.city.toLowerCase()}\`);
+              const today=new Date();
+              const fromISO=new Date(today.getTime()-LOOKBACK_DAYS*DAY_MS).toISOString().slice(0,10);
+              const toISO=new Date(today.getTime()+LOOKAHEAD_DAYS*DAY_MS).toISOString().slice(0,10);
 
-            // filter
-            let out = rows.filter(r => !isBlocked(r));
-            // ensure allowlisted are present
-            const allowAdds = rows.filter(r => isAllowed(r) && !out.some(x=>x.name===r.name && x.city===r.city));
-            out.push(...allowAdds);
-            return out;
-          }
-
-          (async () => {
-            try {
-              const tmKey = process.env.TM_API_KEY;
-              if (!tmKey) throw new Error('Missing TM_API_KEY env');
-
-              const [tm, wd] = await Promise.all([
-                fetchTicketmasterVenuesWA(tmKey, 5),
-                fetchWikidataWA()
-              ]);
-
-              await fs.mkdir('data', { recursive: true });
-              await fs.writeFile('data/tm_wa.csv', toCSV(tm));
-              await fs.writeFile('data/wd_wa.csv', toCSV(wd));
-
-              let combined = mergeAndDedupe(tm, wd);
-
-              // Optional site discovery
-              if (process.env.ENABLE_WEB_SEARCH === '1') {
-                for (const r of combined) {
-                  if (!r.website) {
-                    r.website = await discoverWebsiteBySearch(r.name, r.city);
-                    await new Promise(res=>setTimeout(res, 200));
-                  }
-                }
+              const venues=new Map();
+              for (const city of WA_CITIES){
+                const vs=await getVenuesForCity(city);
+                for (const v of vs) venues.set(v.id,v);
+                await sleep(200);
               }
 
-              // Enrich logo + social
-              combined = await enrichFromSite(combined, 80);
+              const rows=[];
+              for (const v of venues.values()){
+                const {count,latest}=await countEvents(v.id,fromISO,toISO);
+                if (count<MIN_EVENTS) continue;
 
-              // Score + filter by multi-signal evidence
-              combined = await scoreAndFilter(combined, { requireThreshold: 3, lookaheadDays: 120, maxChecks: 160 });
+                let website='', mbid='';
+                try {
+                  const mb=await mbSearchVenue(v.name,v.city?.name||'');
+                  if (mb?.id){
+                    mbid=mb.id;
+                    const urls=await mbPlaceUrls(mbid);
+                    website=urls.homepage||'';
+                    await sleep(150);
+                  }
+                } catch{}
 
-              // Dedupe by domain & apply overrides
-              combined = dedupeByDomain(combined);
-              combined = await applyOverrides(combined);
+                const row={
+                  name:v.name,
+                  city:v.city?.name||'(Unknown City)',
+                  state:'WA',
+                  capacity:'',
+                  age:'',
+                  region:'West',
+                  venueType:'',
+                  genres:'',
+                  image:'',
+                  website,
+                  social:[],
+                  sources:['Setlist.fm'].concat(mbid?['MusicBrainz']:[]),
+                  id:mbid?`mb-${mbid}`:`slfm-${v.id}`,
+                  confidence:95,
+                  event_count:count,
+                  last_event_date:latest
+                };
+                rows.push(await enrichFromWebsite(row));
+                await sleep(200);
+              }
 
-              await fs.writeFile('data/combined_wa.csv', toCSV(combined));
-              console.log(\`TM: \${tm.length}, WD: \${wd.length}, Final after scoring: \${combined.length}\`);
-            } catch (e) {
-              console.error(e);
-              process.exit(1);
-            }
+              const headers=['Venue Name','City','State','Capacity','Age Restrictions','Region','Venue Type','Genres (top 3)',
+                'Image','Website','Social Links','Source(s)','Venue ID','Confidence','Event Count (±12mo)','Last Event Date'];
+              const lines=[headers.map(escapeCSV).join(',')];
+              for (const r of rows){
+                lines.push([
+                  r.name,r.city,r.state,r.capacity,r.age,r.region,r.venueType,r.genres,
+                  r.image,r.website,(r.social||[]).join('|'),(r.sources||[]).join(';'),r.id,r.confidence,
+                  r.event_count,r.last_event_date
+                ].map(escapeCSV).join(','));
+              }
+              await fs.writeFile('data/combined_wa.csv',lines.join('\n')+'\n');
+              console.log(`Final venues: ${rows.length}`);
+            }catch(e){console.error(e);process.exit(1);}
           })();
           EOF
 
@@ -606,6 +249,6 @@ jobs:
       - name: Commit CSVs
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "chore: WA venues — multi-signal scoring, defunct checks, logos, age"
+          commit_message: "chore: WA venues — Setlist.fm verified + MusicBrainz URLs + site images"
           file_pattern: data/*.csv
           branch: main
